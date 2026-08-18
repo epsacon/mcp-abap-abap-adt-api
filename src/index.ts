@@ -3,6 +3,8 @@
 import { config } from 'dotenv';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import express from "express";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -417,25 +419,48 @@ export class AbapAdtServer extends Server {
   }
 
   async run() {
-    const transport = new StdioServerTransport();
-    await this.connect(transport);
-    console.error('MCP ABAP ADT API server running on stdio');
-    
-    // Handle shutdown
-    process.on('SIGINT', async () => {
-      await this.close();
-      process.exit(0);
+    const useStdio = process.argv.includes('--stdio');
+
+    this.onerror = (error) => { console.error('[MCP Error]', error); };
+
+    process.on('SIGINT', async () => { await this.close(); process.exit(0); });
+    process.on('SIGTERM', async () => { await this.close(); process.exit(0); });
+
+    if (useStdio) {
+      const transport = new StdioServerTransport();
+      await this.connect(transport);
+      console.error('MCP ABAP ADT API server running on stdio');
+      return;
+    }
+
+    const app = express();
+    const PORT = parseInt(process.env.PORT ?? '3000', 10);
+    let activeTransport: SSEServerTransport | null = null;
+
+    app.get('/health', (_req, res) => {
+      res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
     });
-    
-    process.on('SIGTERM', async () => {
-      await this.close();
-      process.exit(0);
+
+    app.get('/sse', async (_req, res) => {
+      if (activeTransport) {
+        await this.close();
+        activeTransport = null;
+      }
+      activeTransport = new SSEServerTransport('/message', res);
+      await this.connect(activeTransport);
     });
-    
-    // Handle errors
-    this.onerror = (error) => {
-      console.error('[MCP Error]', error);
-    };
+
+    app.post('/message', express.json(), async (req, res) => {
+      if (!activeTransport) {
+        res.status(503).json({ error: 'No active SSE connection' });
+        return;
+      }
+      await activeTransport.handlePostMessage(req, res);
+    });
+
+    app.listen(PORT, () => {
+      console.error(`MCP ABAP ADT API server running on HTTP/SSE port ${PORT}`);
+    });
   }
 }
 
