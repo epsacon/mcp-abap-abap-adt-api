@@ -12,7 +12,10 @@ import {
   ErrorCode
 } from "@modelcontextprotocol/sdk/types.js";
 import { ADTClient, session_types } from "abap-adt-api";
+import type { ClientOptions } from "abap-adt-api";
 import path from 'path';
+import https from 'https';
+import { createOAuthRouter, isValidToken } from './oauth.js';
 import { AuthHandlers } from './handlers/AuthHandlers.js';
 import { TransportHandlers } from './handlers/TransportHandlers.js';
 import { ObjectHandlers } from './handlers/ObjectHandlers.js';
@@ -41,33 +44,157 @@ import { RevisionHandlers } from './handlers/RevisionHandlers.js';
 
 config({ path: path.resolve(__dirname, '../.env') });
 
+interface SapCredentials {
+  url: string;
+  user: string;
+  password: string;
+  clientOptions: ClientOptions;
+}
+
+async function fetchJson(url: string, options: https.RequestOptions & { body?: string }): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const { body, ...reqOpts } = options;
+    const req = https.request(url, reqOpts, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+        catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function resolveCredentials(): Promise<SapCredentials> {
+  const vcap = process.env.VCAP_SERVICES ? JSON.parse(process.env.VCAP_SERVICES) : null;
+
+  if (vcap) {
+    const destBinding = (vcap['destination'] || [])[0];
+    const connBinding = (vcap['connectivity'] || [])[0];
+
+    if (!destBinding) throw new Error('No destination service binding found in VCAP_SERVICES');
+    if (!connBinding) throw new Error('No connectivity service binding found in VCAP_SERVICES');
+
+    const destCreds = destBinding.credentials;
+    const connCreds = connBinding.credentials;
+    const destinationName = process.env.DESTINATION_NAME || 'S4H_CAL';
+
+    // 1. Get OAuth token for destination service
+    const tokenUrl = new URL(`${destCreds.url}/oauth/token`);
+    const tokenBody = `grant_type=client_credentials&client_id=${encodeURIComponent(destCreds.clientid)}&client_secret=${encodeURIComponent(destCreds.clientsecret)}`;
+    const tokenResp = await fetchJson(tokenUrl.toString(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(tokenBody).toString(),
+      },
+      body: tokenBody,
+    });
+    const accessToken: string = tokenResp.access_token;
+    if (!accessToken) throw new Error(`Failed to get destination service token: ${JSON.stringify(tokenResp)}`);
+
+    // 2. Fetch the destination configuration
+    const destApiUrl = `${destCreds.uri}/destination-configuration/v1/destinations/${destinationName}`;
+    const destResp = await fetchJson(destApiUrl, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    // destinationConfiguration is a flat key→value object in the v1 API response
+    const cfg: Record<string, string> = destResp.destinationConfiguration || {};
+    const sapUrl  = cfg['URL'];
+    const sapUser = cfg['User'];
+    const sapPass = cfg['Password'];
+
+    if (!sapUrl || !sapUser || !sapPass) {
+      throw new Error(`Destination ${destinationName} missing URL/User/Password. Response: ${JSON.stringify(destResp)}`);
+    }
+
+    // 3. Get connectivity proxy JWT (instance identity token)
+    const proxyHost = connCreds.onpremise_proxy_host || 'connectivityproxy.internal';
+    const proxyPort = parseInt(connCreds.onpremise_proxy_http_port || connCreds.onpremise_proxy_port || '20003', 10);
+
+    // The connectivity proxy needs a Proxy-Authorization JWT from the connectivity service token endpoint
+    const connTokenUrl = new URL(`${connCreds.token_service_url}/oauth/token`);
+    const connTokenBody = `grant_type=client_credentials&client_id=${encodeURIComponent(connCreds.clientid)}&client_secret=${encodeURIComponent(connCreds.clientsecret)}`;
+    const connTokenResp = await fetchJson(connTokenUrl.toString(), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(connTokenBody).toString(),
+      },
+      body: connTokenBody,
+    });
+    const proxyToken: string = connTokenResp.access_token;
+    if (!proxyToken) throw new Error(`Failed to get connectivity proxy token: ${JSON.stringify(connTokenResp)}`);
+
+    // 4. Build an https.Agent that routes through the connectivity proxy
+    //    axios uses the httpsAgent for HTTPS targets; the proxy tunnel is HTTP CONNECT
+    const tunnelAgent = new https.Agent({
+      rejectUnauthorized: false,
+      // axios will use HTTPS_PROXY / HTTP_PROXY env vars for the CONNECT tunnel
+    });
+    // Set proxy env vars so axios picks up the tunnel automatically
+    process.env.HTTPS_PROXY = `http://${proxyHost}:${proxyPort}`;
+    process.env.HTTP_PROXY  = `http://${proxyHost}:${proxyPort}`;
+
+    return {
+      url: sapUrl,
+      user: sapUser,
+      password: sapPass,
+      clientOptions: {
+        httpsAgent: tunnelAgent,
+        headers: {
+          'Proxy-Authorization': `Bearer ${proxyToken}`,
+        },
+      },
+    };
+  }
+
+  // Local development — use .env values
+  const missingVars = ['SAP_URL', 'SAP_USER', 'SAP_PASSWORD'].filter(v => !process.env[v]);
+  if (missingVars.length > 0) {
+    throw new Error(`Missing required environment variables: ${missingVars.join(', ')}`);
+  }
+
+  return {
+    url: process.env.SAP_URL as string,
+    user: process.env.SAP_USER as string,
+    password: process.env.SAP_PASSWORD as string,
+    clientOptions: {},
+  };
+}
+
 export class AbapAdtServer extends Server {
-  private adtClient: ADTClient;
-  private authHandlers: AuthHandlers;
-  private transportHandlers: TransportHandlers;
-  private objectHandlers: ObjectHandlers;
-  private classHandlers: ClassHandlers;
-  private codeAnalysisHandlers: CodeAnalysisHandlers;
-  private objectLockHandlers: ObjectLockHandlers;
-  private objectSourceHandlers: ObjectSourceHandlers;
-  private objectDeletionHandlers: ObjectDeletionHandlers;
-  private objectManagementHandlers: ObjectManagementHandlers;
-  private objectRegistrationHandlers: ObjectRegistrationHandlers;
-    private nodeHandlers: NodeHandlers;
-    private discoveryHandlers: DiscoveryHandlers;
-    private unitTestHandlers: UnitTestHandlers;
-    private prettyPrinterHandlers: PrettyPrinterHandlers;
-    private gitHandlers: GitHandlers;
-    private ddicHandlers: DdicHandlers;
-    private serviceBindingHandlers: ServiceBindingHandlers;
-    private queryHandlers: QueryHandlers;
-    private feedHandlers: FeedHandlers;
-    private debugHandlers: DebugHandlers;
-    private renameHandlers: RenameHandlers;
-    private atcHandlers: AtcHandlers;
-    private traceHandlers: TraceHandlers;
-    private refactorHandlers: RefactorHandlers;
-    private revisionHandlers: RevisionHandlers;
+  private adtClient!: ADTClient;
+  private authHandlers!: AuthHandlers;
+  private transportHandlers!: TransportHandlers;
+  private objectHandlers!: ObjectHandlers;
+  private classHandlers!: ClassHandlers;
+  private codeAnalysisHandlers!: CodeAnalysisHandlers;
+  private objectLockHandlers!: ObjectLockHandlers;
+  private objectSourceHandlers!: ObjectSourceHandlers;
+  private objectDeletionHandlers!: ObjectDeletionHandlers;
+  private objectManagementHandlers!: ObjectManagementHandlers;
+  private objectRegistrationHandlers!: ObjectRegistrationHandlers;
+  private nodeHandlers!: NodeHandlers;
+  private discoveryHandlers!: DiscoveryHandlers;
+  private unitTestHandlers!: UnitTestHandlers;
+  private prettyPrinterHandlers!: PrettyPrinterHandlers;
+  private gitHandlers!: GitHandlers;
+  private ddicHandlers!: DdicHandlers;
+  private serviceBindingHandlers!: ServiceBindingHandlers;
+  private queryHandlers!: QueryHandlers;
+  private feedHandlers!: FeedHandlers;
+  private debugHandlers!: DebugHandlers;
+  private renameHandlers!: RenameHandlers;
+  private atcHandlers!: AtcHandlers;
+  private traceHandlers!: TraceHandlers;
+  private refactorHandlers!: RefactorHandlers;
+  private revisionHandlers!: RevisionHandlers;
 
     constructor() {
     super(
@@ -81,21 +208,22 @@ export class AbapAdtServer extends Server {
         },
       }
     );
+    // adtClient and handlers are initialised in init() before run() starts accepting requests
+  }
 
-    const missingVars = ['SAP_URL', 'SAP_USER', 'SAP_PASSWORD'].filter(v => !process.env[v]);
-    if (missingVars.length > 0) {
-      throw new Error(`Missing required environment variables: ${missingVars.join(', ')}`);
-    }
-    
+  async init(): Promise<void> {
+    const creds = await resolveCredentials();
+
     this.adtClient = new ADTClient(
-      process.env.SAP_URL as string,
-      process.env.SAP_USER as string,
-      process.env.SAP_PASSWORD as string,
+      creds.url,
+      creds.user,
+      creds.password,
       process.env.SAP_CLIENT as string,
-      process.env.SAP_LANGUAGE as string
+      process.env.SAP_LANGUAGE as string,
+      creds.clientOptions
     );
-    this.adtClient.stateful = session_types.stateful
-    
+    this.adtClient.stateful = session_types.stateful;
+
     // Initialize handlers
     this.authHandlers = new AuthHandlers(this.adtClient);
     this.transportHandlers = new TransportHandlers(this.adtClient);
@@ -123,8 +251,6 @@ export class AbapAdtServer extends Server {
     this.refactorHandlers = new RefactorHandlers(this.adtClient);
     this.revisionHandlers = new RevisionHandlers(this.adtClient);
 
-
-        // Setup tool handlers
     this.setupToolHandlers();
   }
 
@@ -419,6 +545,8 @@ export class AbapAdtServer extends Server {
   }
 
   async run() {
+    await this.init();
+
     const useStdio = process.argv.includes('--stdio');
 
     this.onerror = (error) => { console.error('[MCP Error]', error); };
@@ -435,27 +563,59 @@ export class AbapAdtServer extends Server {
 
     const app = express();
     const PORT = parseInt(process.env.PORT ?? '3000', 10);
+    const BASE_URL = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
     let activeTransport: SSEServerTransport | null = null;
+
+    app.use(express.json());
+    app.use(express.urlencoded({ extended: false }));
+
+    // OAuth 2.1 endpoints (unauthenticated — they ARE the auth flow)
+    app.use(createOAuthRouter(BASE_URL));
 
     app.get('/health', (_req, res) => {
       res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
     });
 
-    app.get('/sse', async (_req, res) => {
+    // Bearer token guard for MCP endpoints
+    const requireBearer = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      const auth = req.headers['authorization'];
+      const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+      if (!token || !isValidToken(token)) {
+        res.setHeader('WWW-Authenticate', `Bearer realm="${BASE_URL}"`)
+           .status(401)
+           .json({ error: 'unauthorized', error_description: 'Valid bearer token required' });
+        return;
+      }
+      next();
+    };
+
+    app.get('/sse', requireBearer, async (_req, res) => {
+      // Close the previous MCP session before accepting a new one
       if (activeTransport) {
-        await this.close();
+        try { await this.close(); } catch (_) {}
         activeTransport = null;
       }
-      activeTransport = new SSEServerTransport('/message', res);
-      await this.connect(activeTransport);
+      const transport = new SSEServerTransport('/message', res);
+      activeTransport = transport;
+      res.on('close', () => {
+        if (activeTransport === transport) activeTransport = null;
+      });
+      await this.connect(transport);
     });
 
-    app.post('/message', express.json(), async (req, res) => {
+    app.post('/message', requireBearer, async (req, res) => {
       if (!activeTransport) {
         res.status(503).json({ error: 'No active SSE connection' });
         return;
       }
-      await activeTransport.handlePostMessage(req, res);
+      try {
+        await activeTransport.handlePostMessage(req, res);
+      } catch (err: any) {
+        console.error('[MCP] handlePostMessage error:', err?.message ?? err);
+        if (!res.headersSent) {
+          res.status(500).json({ error: err?.message ?? 'Internal server error' });
+        }
+      }
     });
 
     app.listen(PORT, () => {

@@ -1,0 +1,16 @@
+applications:
+  - name: epsa-ai-link
+    buildpacks:
+      - nodejs_buildpack
+    memory: 256M
+    instances: 1
+    command: npm start
+    env:
+      SAP_CLIENT: "100"
+      SAP_LANGUAGE: EN
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+      DESTINATION_NAME: S4H_CAL
+      APP_BASE_URL: https://epsa-ai-link.cfapps.us10-001.hana.ondemand.com
+    services:
+      - epsa-connectivity
+      - epsa-destination
