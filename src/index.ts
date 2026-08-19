@@ -4,6 +4,7 @@ import { config } from 'dotenv';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import {
   CallToolRequestSchema,
@@ -212,6 +213,10 @@ export class AbapAdtServer extends Server {
   }
 
   async init(): Promise<void> {
+    await this.initHandlers();
+  }
+
+  async initHandlers(): Promise<void> {
     const creds = await resolveCredentials();
 
     this.adtClient = new ADTClient(
@@ -564,10 +569,12 @@ export class AbapAdtServer extends Server {
     const app = express();
     const PORT = parseInt(process.env.PORT ?? '3000', 10);
     const BASE_URL = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
-    let activeTransport: SSEServerTransport | null = null;
 
-    app.use(express.json());
-    app.use(express.urlencoded({ extended: false }));
+    // Body parsing only for OAuth and non-MCP routes; /message and /mcp handle their own body reading
+    app.use((req, _res, next) => {
+      if (req.path === '/message' || req.path === '/mcp') return next();
+      express.json()(req, _res, () => express.urlencoded({ extended: false })(req, _res, next));
+    });
 
     // OAuth 2.1 endpoints (unauthenticated — they ARE the auth flow)
     app.use(createOAuthRouter(BASE_URL));
@@ -589,27 +596,49 @@ export class AbapAdtServer extends Server {
       next();
     };
 
+    // ── Streamable HTTP transport (new spec — used by claude.ai) ──────────────
+    const streamableTransport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // stateless
+    });
+    await this.connect(streamableTransport);
+
+    app.all('/mcp', requireBearer, async (req, res) => {
+      await streamableTransport.handleRequest(req, res, req.body);
+    });
+
+    // ── Legacy SSE transport (used by Claude Code via .mcp.json) ─────────────
+    // Each SSE connection gets its own Server instance so it doesn't conflict
+    // with the streamable transport connected to `this`.
+    let activeSseTransport: SSEServerTransport | null = null;
+    let activeSseServer: AbapAdtServer | null = null;
+
     app.get('/sse', requireBearer, async (_req, res) => {
-      // Close the previous MCP session before accepting a new one
-      if (activeTransport) {
-        try { await this.close(); } catch (_) {}
-        activeTransport = null;
+      if (activeSseTransport) {
+        try { await activeSseServer?.close(); } catch (_) {}
+        activeSseTransport = null;
+        activeSseServer = null;
       }
+      const sseServer = new AbapAdtServer();
+      await sseServer.initHandlers();
       const transport = new SSEServerTransport('/message', res);
-      activeTransport = transport;
+      activeSseTransport = transport;
+      activeSseServer = sseServer;
       res.on('close', () => {
-        if (activeTransport === transport) activeTransport = null;
+        if (activeSseTransport === transport) {
+          activeSseTransport = null;
+          activeSseServer = null;
+        }
       });
-      await this.connect(transport);
+      await sseServer.connect(transport);
     });
 
     app.post('/message', requireBearer, async (req, res) => {
-      if (!activeTransport) {
+      if (!activeSseTransport) {
         res.status(503).json({ error: 'No active SSE connection' });
         return;
       }
       try {
-        await activeTransport.handlePostMessage(req, res);
+        await activeSseTransport.handlePostMessage(req, res);
       } catch (err: any) {
         console.error('[MCP] handlePostMessage error:', err?.message ?? err);
         if (!res.headersSent) {
